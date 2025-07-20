@@ -11,7 +11,7 @@ require('dotenv').config();
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const chatRoutes = require('./routes/chat');
-const matchingRoutes = require('./routes/matching');
+const matchesRoutes = require('./routes/matches');
 const coinRoutes = require('./routes/coins');
 const mediaRoutes = require('./routes/media');
 
@@ -62,7 +62,7 @@ app.use('/uploads', express.static('uploads'));
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/chat', chatRoutes);
-app.use('/api/matching', matchingRoutes);
+app.use('/api/matches', matchesRoutes);
 app.use('/api/coins', coinRoutes);
 app.use('/api/media', mediaRoutes);
 

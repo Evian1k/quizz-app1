@@ -201,11 +201,15 @@ const authenticateSocket = async (socket, next) => {
   }
 };
 
+// Check if user has enough coins (alias for requireCoins)
+const checkCoins = (requiredCoins) => requireCoins(requiredCoins);
+
 module.exports = {
   authenticateToken,
   optionalAuth,
   requireVerified,
   requirePremium,
   requireCoins,
+  checkCoins,
   authenticateSocket
 };
