@@ -14,6 +14,7 @@ const chatRoutes = require('./routes/chat');
 const matchesRoutes = require('./routes/matches');
 const coinRoutes = require('./routes/coins');
 const mediaRoutes = require('./routes/media');
+const callRoutes = require('./routes/calls');
 
 const socketHandler = require('./utils/socketHandler');
 const { connectDB } = require('./config/database');
@@ -65,6 +66,13 @@ app.use('/api/chat', chatRoutes);
 app.use('/api/matches', matchesRoutes);
 app.use('/api/coins', coinRoutes);
 app.use('/api/media', mediaRoutes);
+app.use('/api/calls', callRoutes);
+
+// Middleware to attach io to request for real-time features
+app.use((req, res, next) => {
+  req.io = io;
+  next();
+});
 
 // Health check endpoint
 app.get('/health', (req, res) => {

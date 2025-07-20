@@ -42,7 +42,13 @@
     "uuid": "^9.0.1",
     "axios": "^1.6.5",
     "node-cron": "^3.0.3",
-    "winston": "^3.11.0"
+    "winston": "^3.11.0",
+    "stripe": "^14.11.0",
+    "cloudinary": "^1.41.0",
+    "@google-cloud/translate": "^8.0.2",
+    "firebase-admin": "^12.0.0",
+    "sharp": "^0.33.1",
+    "ffmpeg-static": "^5.2.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2",

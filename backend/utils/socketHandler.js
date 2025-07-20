@@ -1,364 +1,514 @@
-const { authenticateSocket } = require('../middleware/auth');
-const { setUserOnline, setUserOffline, isUserOnline } = require('../config/redis');
-const Message = require('../models/Message');
-const Conversation = require('../models/Conversation');
+const jwt = require('jsonwebtoken');
+const { query } = require('../config/database');
+const { setUserOnline, setUserOffline, getUserOnlineStatus } = require('../config/redis');
 
 // Store active connections
 const activeConnections = new Map();
-const videoCallRooms = new Map();
+const callRooms = new Map();
+const conversationRooms = new Map();
 
 function socketHandler(io) {
-  // Authentication middleware
-  io.use(authenticateSocket);
-
-  io.on('connection', async (socket) => {
-    console.log(`User ${socket.user.username} connected with socket ${socket.id}`);
-    
-    // Store connection
-    activeConnections.set(socket.userId, {
-      socketId: socket.id,
-      user: socket.user,
-      lastSeen: new Date()
-    });
-
-    // Set user online in Redis
-    await setUserOnline(socket.userId, socket.id);
-
-    // Join user to their personal room for notifications
-    socket.join(`user_${socket.userId}`);
-
-    // Emit online status to friends/matches
-    socket.broadcast.emit('user_online', {
-      userId: socket.userId,
-      username: socket.user.username
-    });
-
-    // Handle joining conversation rooms
-    socket.on('join_conversation', async (data) => {
-      try {
-        const { conversationId } = data;
-        
-        // Verify user is participant in conversation
-        const conversation = await Conversation.findById(conversationId);
-        if (!conversation) {
-          socket.emit('error', { message: 'Conversation not found' });
-          return;
-        }
-
-        const isParticipant = conversation.participant1_id === socket.userId || 
-                             conversation.participant2_id === socket.userId;
-        
-        if (!isParticipant) {
-          socket.emit('error', { message: 'Not authorized to join this conversation' });
-          return;
-        }
-
-        socket.join(`conversation_${conversationId}`);
-        socket.currentConversation = conversationId;
-        
-        // Mark messages as read
-        await Message.markAsRead(conversationId, socket.userId);
-        
-        socket.emit('joined_conversation', { conversationId });
-        
-        // Notify other participant that user is online in conversation
-        socket.to(`conversation_${conversationId}`).emit('user_joined_conversation', {
-          userId: socket.userId,
-          username: socket.user.username
-        });
-      } catch (error) {
-        console.error('Join conversation error:', error);
-        socket.emit('error', { message: 'Failed to join conversation' });
-      }
-    });
-
-    // Handle leaving conversation
-    socket.on('leave_conversation', (data) => {
-      const { conversationId } = data;
-      socket.leave(`conversation_${conversationId}`);
-      socket.currentConversation = null;
+  // Authentication middleware for socket connections
+  io.use(async (socket, next) => {
+    try {
+      const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
       
-      socket.to(`conversation_${conversationId}`).emit('user_left_conversation', {
-        userId: socket.userId,
-        username: socket.user.username
-      });
-    });
-
-    // Handle sending messages
-    socket.on('send_message', async (data) => {
-      try {
-        const { conversationId, content, messageType = 'text', mediaUrl, mediaMetadata } = data;
-        
-        // Verify user is in conversation
-        if (socket.currentConversation !== conversationId) {
-          socket.emit('error', { message: 'Join conversation first' });
-          return;
-        }
-
-        // Create message
-        const message = await Message.create({
-          conversationId,
-          senderId: socket.userId,
-          content,
-          messageType,
-          mediaUrl,
-          mediaMetadata
-        });
-
-        // Get full message with sender info
-        const fullMessage = await Message.getWithSender(message.id);
-
-        // Emit to conversation room
-        io.to(`conversation_${conversationId}`).emit('new_message', fullMessage);
-
-        // Send push notification to offline users
-        const conversation = await Conversation.findById(conversationId);
-        const recipientId = conversation.participant1_id === socket.userId ? 
-                           conversation.participant2_id : conversation.participant1_id;
-        
-        const isRecipientOnline = await isUserOnline(recipientId);
-        if (!isRecipientOnline) {
-          // Send push notification (implement with FCM)
-          // await sendPushNotification(recipientId, {
-          //   title: `New message from ${socket.user.firstName}`,
-          //   body: content,
-          //   data: { conversationId, messageId: message.id }
-          // });
-        }
-
-      } catch (error) {
-        console.error('Send message error:', error);
-        socket.emit('error', { message: 'Failed to send message' });
+      if (!token) {
+        return next(new Error('Authentication token required'));
       }
-    });
 
-    // Handle typing indicators
-    socket.on('typing_start', (data) => {
-      const { conversationId } = data;
-      if (socket.currentConversation === conversationId) {
-        socket.to(`conversation_${conversationId}`).emit('user_typing', {
-          userId: socket.userId,
-          username: socket.user.username,
-          isTyping: true
-        });
-      }
-    });
-
-    socket.on('typing_stop', (data) => {
-      const { conversationId } = data;
-      if (socket.currentConversation === conversationId) {
-        socket.to(`conversation_${conversationId}`).emit('user_typing', {
-          userId: socket.userId,
-          username: socket.user.username,
-          isTyping: false
-        });
-      }
-    });
-
-    // Handle message reactions
-    socket.on('react_to_message', async (data) => {
-      try {
-        const { messageId, reaction } = data;
-        
-        await Message.addReaction(messageId, socket.userId, reaction);
-        
-        // Get message to find conversation
-        const message = await Message.findById(messageId);
-        if (message) {
-          io.to(`conversation_${message.conversation_id}`).emit('message_reaction', {
-            messageId,
-            userId: socket.userId,
-            username: socket.user.username,
-            reaction
-          });
-        }
-      } catch (error) {
-        console.error('Message reaction error:', error);
-        socket.emit('error', { message: 'Failed to add reaction' });
-      }
-    });
-
-    // Video call signaling
-    socket.on('call_user', async (data) => {
-      try {
-        const { recipientId, conversationId, offer, callType = 'video' } = data;
-        
-        // Verify conversation exists and user is participant
-        const conversation = await Conversation.findById(conversationId);
-        if (!conversation) {
-          socket.emit('call_error', { message: 'Conversation not found' });
-          return;
-        }
-
-        const isParticipant = conversation.participant1_id === socket.userId || 
-                             conversation.participant2_id === socket.userId;
-        
-        if (!isParticipant) {
-          socket.emit('call_error', { message: 'Not authorized' });
-          return;
-        }
-
-        // Create call room
-        const callId = `call_${Date.now()}_${socket.userId}`;
-        videoCallRooms.set(callId, {
-          callerId: socket.userId,
-          recipientId,
-          conversationId,
-          callType,
-          status: 'ringing',
-          startTime: new Date()
-        });
-
-        // Notify recipient
-        io.to(`user_${recipientId}`).emit('incoming_call', {
-          callId,
-          callerId: socket.userId,
-          callerName: socket.user.firstName,
-          callerPicture: socket.user.profilePicture,
-          conversationId,
-          callType,
-          offer
-        });
-
-        socket.emit('call_initiated', { callId });
-
-        // Auto-decline after 30 seconds
-        setTimeout(() => {
-          const call = videoCallRooms.get(callId);
-          if (call && call.status === 'ringing') {
-            videoCallRooms.delete(callId);
-            socket.emit('call_declined', { callId, reason: 'timeout' });
-            io.to(`user_${recipientId}`).emit('call_ended', { callId, reason: 'timeout' });
-          }
-        }, 30000);
-
-      } catch (error) {
-        console.error('Call user error:', error);
-        socket.emit('call_error', { message: 'Failed to initiate call' });
-      }
-    });
-
-    socket.on('answer_call', (data) => {
-      const { callId, answer } = data;
-      const call = videoCallRooms.get(callId);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
       
-      if (call && call.recipientId === socket.userId) {
-        call.status = 'active';
-        
-        // Join both users to call room
-        socket.join(callId);
-        const callerSocket = [...activeConnections.entries()]
-          .find(([userId, conn]) => userId === call.callerId);
-        
-        if (callerSocket) {
-          io.sockets.sockets.get(callerSocket[1].socketId)?.join(callId);
-        }
+      // Get user details
+      const userResult = await query(
+        'SELECT id, name, email, avatar, is_verified, is_online FROM users WHERE id = $1',
+        [decoded.userId]
+      );
 
-        io.to(callId).emit('call_answered', { callId, answer });
-      }
-    });
-
-    socket.on('decline_call', (data) => {
-      const { callId } = data;
-      const call = videoCallRooms.get(callId);
-      
-      if (call && call.recipientId === socket.userId) {
-        videoCallRooms.delete(callId);
-        io.to(`user_${call.callerId}`).emit('call_declined', { callId });
-      }
-    });
-
-    socket.on('end_call', (data) => {
-      const { callId } = data;
-      const call = videoCallRooms.get(callId);
-      
-      if (call && (call.callerId === socket.userId || call.recipientId === socket.userId)) {
-        videoCallRooms.delete(callId);
-        io.to(callId).emit('call_ended', { callId });
-        
-        // Leave call room
-        socket.leave(callId);
-      }
-    });
-
-    // WebRTC signaling for peer-to-peer connection
-    socket.on('webrtc_offer', (data) => {
-      const { callId, offer } = data;
-      socket.to(callId).emit('webrtc_offer', { offer, from: socket.userId });
-    });
-
-    socket.on('webrtc_answer', (data) => {
-      const { callId, answer } = data;
-      socket.to(callId).emit('webrtc_answer', { answer, from: socket.userId });
-    });
-
-    socket.on('webrtc_ice_candidate', (data) => {
-      const { callId, candidate } = data;
-      socket.to(callId).emit('webrtc_ice_candidate', { candidate, from: socket.userId });
-    });
-
-    // Handle match notifications
-    socket.on('new_match', async (data) => {
-      const { matchId, otherUserId } = data;
-      
-      // Notify both users about the match
-      io.to(`user_${otherUserId}`).emit('match_found', {
-        matchId,
-        userId: socket.userId,
-        user: socket.user
-      });
-    });
-
-    // Handle disconnect
-    socket.on('disconnect', async (reason) => {
-      console.log(`User ${socket.user.username} disconnected: ${reason}`);
-      
-      // Remove from active connections
-      activeConnections.delete(socket.userId);
-      
-      // Set user offline
-      await setUserOffline(socket.userId);
-      
-      // Notify others user went offline
-      socket.broadcast.emit('user_offline', {
-        userId: socket.userId,
-        username: socket.user.username
-      });
-
-      // Leave current conversation
-      if (socket.currentConversation) {
-        socket.to(`conversation_${socket.currentConversation}`).emit('user_left_conversation', {
-          userId: socket.userId,
-          username: socket.user.username
-        });
+      if (userResult.rows.length === 0) {
+        return next(new Error('User not found'));
       }
 
-      // End any active calls
-      for (const [callId, call] of videoCallRooms.entries()) {
-        if (call.callerId === socket.userId || call.recipientId === socket.userId) {
-          videoCallRooms.delete(callId);
-          io.to(callId).emit('call_ended', { callId, reason: 'user_disconnected' });
-        }
+      const user = userResult.rows[0];
+      if (!user.is_verified) {
+        return next(new Error('User not verified'));
       }
-    });
 
-    // Error handling
-    socket.on('error', (error) => {
-      console.error('Socket error:', error);
-    });
+      socket.userId = user.id;
+      socket.user = user;
+      
+      next();
+    } catch (error) {
+      console.error('Socket authentication error:', error);
+      next(new Error('Authentication failed'));
+    }
   });
 
-  // Cleanup inactive connections periodically
-  setInterval(() => {
-    const now = new Date();
-    for (const [userId, connection] of activeConnections.entries()) {
-      const timeDiff = now - connection.lastSeen;
-      if (timeDiff > 5 * 60 * 1000) { // 5 minutes
-        activeConnections.delete(userId);
-        setUserOffline(userId);
-      }
+  io.on('connection', async (socket) => {
+    const userId = socket.userId;
+    const user = socket.user;
+    
+    console.log(`✅ User ${user.name} (${userId}) connected with socket ${socket.id}`);
+    
+    try {
+      // Store connection
+      activeConnections.set(userId, {
+        socketId: socket.id,
+        user: user,
+        lastSeen: new Date(),
+        rooms: new Set()
+      });
+
+      // Set user online in Redis and database
+      await setUserOnline(userId, socket.id);
+      await query('UPDATE users SET is_online = true, last_seen = NOW() WHERE id = $1', [userId]);
+
+      // Join user to their personal room for notifications
+      socket.join(`user_${userId}`);
+
+      // Emit online status to user's matches and conversations
+      const matchesResult = await query(`
+        SELECT DISTINCT 
+          CASE 
+            WHEN user1_id = $1 THEN user2_id 
+            ELSE user1_id 
+          END as other_user_id
+        FROM matches 
+        WHERE (user1_id = $1 OR user2_id = $1) 
+        AND user1_liked = true AND user2_liked = true
+      `, [userId]);
+
+      // Notify matches that user is online
+      matchesResult.rows.forEach(match => {
+        socket.to(`user_${match.other_user_id}`).emit('user_online', {
+          userId: userId,
+          name: user.name,
+          avatar: user.avatar
+        });
+      });
+
+      // Send user their current online status and unread counts
+      const unreadResult = await query(`
+        SELECT 
+          c.id as conversation_id,
+          COUNT(m.id) as unread_count
+        FROM conversations c
+        LEFT JOIN messages m ON c.id = m.conversation_id
+        LEFT JOIN message_reads mr ON m.id = mr.message_id AND mr.user_id = $1
+        WHERE $1 = ANY(c.participants) 
+        AND m.sender_id != $1 
+        AND mr.user_id IS NULL
+        GROUP BY c.id
+      `, [userId]);
+
+      socket.emit('connection_established', {
+        user: {
+          id: user.id,
+          name: user.name,
+          avatar: user.avatar
+        },
+        unreadCounts: unreadResult.rows.reduce((acc, row) => {
+          acc[row.conversation_id] = parseInt(row.unread_count);
+          return acc;
+        }, {}),
+        timestamp: new Date().toISOString()
+      });
+
+      // Handle joining conversation rooms
+      socket.on('join_conversation', async (data) => {
+        try {
+          const { conversationId } = data;
+          
+          if (!conversationId) {
+            socket.emit('error', { message: 'Conversation ID required' });
+            return;
+          }
+
+          // Verify user is participant in conversation
+          const conversationResult = await query(
+            'SELECT participants FROM conversations WHERE id = $1',
+            [conversationId]
+          );
+
+          if (conversationResult.rows.length === 0) {
+            socket.emit('error', { message: 'Conversation not found' });
+            return;
+          }
+
+          const participants = conversationResult.rows[0].participants;
+          if (!participants.includes(userId)) {
+            socket.emit('error', { message: 'Access denied' });
+            return;
+          }
+
+          // Join conversation room
+          socket.join(conversationId);
+          activeConnections.get(userId).rooms.add(conversationId);
+
+          // Track conversation room
+          if (!conversationRooms.has(conversationId)) {
+            conversationRooms.set(conversationId, new Set());
+          }
+          conversationRooms.get(conversationId).add(userId);
+
+          socket.emit('joined_conversation', { conversationId });
+          
+          // Notify other participants that user joined
+          socket.to(conversationId).emit('user_joined_conversation', {
+            conversationId,
+            userId,
+            userName: user.name
+          });
+
+        } catch (error) {
+          console.error('Join conversation error:', error);
+          socket.emit('error', { message: 'Failed to join conversation' });
+        }
+      });
+
+      // Handle leaving conversation rooms
+      socket.on('leave_conversation', (data) => {
+        try {
+          const { conversationId } = data;
+          
+          if (!conversationId) return;
+
+          socket.leave(conversationId);
+          activeConnections.get(userId)?.rooms.delete(conversationId);
+
+          if (conversationRooms.has(conversationId)) {
+            conversationRooms.get(conversationId).delete(userId);
+            if (conversationRooms.get(conversationId).size === 0) {
+              conversationRooms.delete(conversationId);
+            }
+          }
+
+          socket.to(conversationId).emit('user_left_conversation', {
+            conversationId,
+            userId,
+            userName: user.name
+          });
+
+        } catch (error) {
+          console.error('Leave conversation error:', error);
+        }
+      });
+
+      // Handle typing indicators
+      socket.on('typing_start', (data) => {
+        try {
+          const { conversationId } = data;
+          if (!conversationId) return;
+
+          socket.to(conversationId).emit('user_typing', {
+            conversationId,
+            userId,
+            userName: user.name,
+            isTyping: true
+          });
+        } catch (error) {
+          console.error('Typing start error:', error);
+        }
+      });
+
+      socket.on('typing_stop', (data) => {
+        try {
+          const { conversationId } = data;
+          if (!conversationId) return;
+
+          socket.to(conversationId).emit('user_typing', {
+            conversationId,
+            userId,
+            userName: user.name,
+            isTyping: false
+          });
+        } catch (error) {
+          console.error('Typing stop error:', error);
+        }
+      });
+
+      // Handle call signaling
+      socket.on('call_offer', async (data) => {
+        try {
+          const { callId, recipientId, offer } = data;
+          
+          if (!callId || !recipientId || !offer) {
+            socket.emit('error', { message: 'Missing call data' });
+            return;
+          }
+
+          // Verify call exists and user is participant
+          const callResult = await query(
+            'SELECT * FROM calls WHERE id = $1 AND (caller_id = $2 OR recipient_id = $2)',
+            [callId, userId]
+          );
+
+          if (callResult.rows.length === 0) {
+            socket.emit('error', { message: 'Call not found or access denied' });
+            return;
+          }
+
+          // Forward offer to recipient
+          io.to(`user_${recipientId}`).emit('call_offer', {
+            callId,
+            offer,
+            from: userId,
+            caller: {
+              id: user.id,
+              name: user.name,
+              avatar: user.avatar
+            }
+          });
+
+        } catch (error) {
+          console.error('Call offer error:', error);
+          socket.emit('error', { message: 'Failed to send call offer' });
+        }
+      });
+
+      socket.on('call_answer', async (data) => {
+        try {
+          const { callId, callerId, answer } = data;
+          
+          if (!callId || !callerId || !answer) {
+            socket.emit('error', { message: 'Missing call data' });
+            return;
+          }
+
+          // Forward answer to caller
+          io.to(`user_${callerId}`).emit('call_answer', {
+            callId,
+            answer,
+            from: userId,
+            recipient: {
+              id: user.id,
+              name: user.name,
+              avatar: user.avatar
+            }
+          });
+
+        } catch (error) {
+          console.error('Call answer error:', error);
+          socket.emit('error', { message: 'Failed to send call answer' });
+        }
+      });
+
+      socket.on('ice_candidate', async (data) => {
+        try {
+          const { callId, candidate, targetUserId } = data;
+          
+          if (!callId || !candidate || !targetUserId) {
+            socket.emit('error', { message: 'Missing ICE candidate data' });
+            return;
+          }
+
+          // Forward ICE candidate to target user
+          io.to(`user_${targetUserId}`).emit('ice_candidate', {
+            callId,
+            candidate,
+            from: userId
+          });
+
+        } catch (error) {
+          console.error('ICE candidate error:', error);
+          socket.emit('error', { message: 'Failed to send ICE candidate' });
+        }
+      });
+
+      // Handle user presence updates
+      socket.on('update_presence', async (data) => {
+        try {
+          const { status } = data; // 'online', 'away', 'busy'
+          
+          if (!['online', 'away', 'busy'].includes(status)) {
+            socket.emit('error', { message: 'Invalid presence status' });
+            return;
+          }
+
+          // Update presence in database
+          await query('UPDATE users SET presence_status = $1 WHERE id = $2', [status, userId]);
+
+          // Notify matches about presence change
+          const matchesResult = await query(`
+            SELECT DISTINCT 
+              CASE 
+                WHEN user1_id = $1 THEN user2_id 
+                ELSE user1_id 
+              END as other_user_id
+            FROM matches 
+            WHERE (user1_id = $1 OR user2_id = $1) 
+            AND user1_liked = true AND user2_liked = true
+          `, [userId]);
+
+          matchesResult.rows.forEach(match => {
+            socket.to(`user_${match.other_user_id}`).emit('presence_update', {
+              userId: userId,
+              status: status,
+              timestamp: new Date().toISOString()
+            });
+          });
+
+        } catch (error) {
+          console.error('Presence update error:', error);
+          socket.emit('error', { message: 'Failed to update presence' });
+        }
+      });
+
+      // Handle message read receipts
+      socket.on('mark_messages_read', async (data) => {
+        try {
+          const { conversationId, messageIds } = data;
+          
+          if (!conversationId || !Array.isArray(messageIds)) {
+            socket.emit('error', { message: 'Invalid read receipt data' });
+            return;
+          }
+
+          // Mark messages as read
+          for (const messageId of messageIds) {
+            await query(`
+              INSERT INTO message_reads (message_id, user_id, read_at)
+              VALUES ($1, $2, NOW())
+              ON CONFLICT (message_id, user_id) DO NOTHING
+            `, [messageId, userId]);
+          }
+
+          // Notify other participants about read receipts
+          socket.to(conversationId).emit('messages_read', {
+            conversationId,
+            messageIds,
+            readBy: userId,
+            readAt: new Date().toISOString()
+          });
+
+        } catch (error) {
+          console.error('Mark messages read error:', error);
+          socket.emit('error', { message: 'Failed to mark messages as read' });
+        }
+      });
+
+      // Handle location sharing (for matching)
+      socket.on('update_location', async (data) => {
+        try {
+          const { latitude, longitude } = data;
+          
+          if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+            socket.emit('error', { message: 'Invalid location data' });
+            return;
+          }
+
+          // Update user location
+          await query(`
+            UPDATE users 
+            SET latitude = $1, longitude = $2, location_updated_at = NOW() 
+            WHERE id = $3
+          `, [latitude, longitude, userId]);
+
+          socket.emit('location_updated', { 
+            message: 'Location updated successfully',
+            timestamp: new Date().toISOString()
+          });
+
+        } catch (error) {
+          console.error('Location update error:', error);
+          socket.emit('error', { message: 'Failed to update location' });
+        }
+      });
+
+      // Handle disconnect
+      socket.on('disconnect', async (reason) => {
+        console.log(`❌ User ${user.name} (${userId}) disconnected: ${reason}`);
+        
+        try {
+          // Remove from active connections
+          activeConnections.delete(userId);
+
+          // Clean up conversation rooms
+          for (const conversationId of activeConnections.get(userId)?.rooms || []) {
+            if (conversationRooms.has(conversationId)) {
+              conversationRooms.get(conversationId).delete(userId);
+              if (conversationRooms.get(conversationId).size === 0) {
+                conversationRooms.delete(conversationId);
+              }
+            }
+          }
+
+          // Set user offline
+          await setUserOffline(userId);
+          await query('UPDATE users SET is_online = false, last_seen = NOW() WHERE id = $1', [userId]);
+
+          // Notify matches that user is offline
+          const matchesResult = await query(`
+            SELECT DISTINCT 
+              CASE 
+                WHEN user1_id = $1 THEN user2_id 
+                ELSE user1_id 
+              END as other_user_id
+            FROM matches 
+            WHERE (user1_id = $1 OR user2_id = $1) 
+            AND user1_liked = true AND user2_liked = true
+          `, [userId]);
+
+          matchesResult.rows.forEach(match => {
+            socket.to(`user_${match.other_user_id}`).emit('user_offline', {
+              userId: userId,
+              name: user.name,
+              lastSeen: new Date().toISOString()
+            });
+          });
+
+        } catch (error) {
+          console.error('Disconnect cleanup error:', error);
+        }
+      });
+
+      // Handle errors
+      socket.on('error', (error) => {
+        console.error('Socket error for user', userId, ':', error);
+      });
+
+    } catch (error) {
+      console.error('Socket connection error:', error);
+      socket.emit('error', { message: 'Connection setup failed' });
+      socket.disconnect();
     }
-  }, 60000); // Check every minute
+  });
+
+  // Handle connection errors
+  io.on('connect_error', (error) => {
+    console.error('Socket.io connection error:', error);
+  });
+
+  return io;
 }
 
-module.exports = socketHandler;
+// Helper functions
+function getActiveConnections() {
+  return Array.from(activeConnections.values());
+}
+
+function getUserConnection(userId) {
+  return activeConnections.get(userId);
+}
+
+function isUserConnected(userId) {
+  return activeConnections.has(userId);
+}
+
+function getConversationParticipants(conversationId) {
+  return Array.from(conversationRooms.get(conversationId) || []);
+}
+
+function broadcastToMatches(userId, event, data) {
+  // This would need to be called from outside with the io instance
+  // Implementation would query user's matches and emit to them
+}
+
+module.exports = {
+  socketHandler,
+  getActiveConnections,
+  getUserConnection,
+  isUserConnected,
+  getConversationParticipants,
+  broadcastToMatches
+};
