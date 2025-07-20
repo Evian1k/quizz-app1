@@ -17,13 +17,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.chatzone.app",
-      "buildNumber": "1.0.0",
-      "infoPlist": {
-        "NSCameraUsageDescription": "ChatzOne needs camera access for profile pictures and video calls",
-        "NSMicrophoneUsageDescription": "ChatzOne needs microphone access for voice messages and video calls",
-        "NSPhotoLibraryUsageDescription": "ChatzOne needs photo library access to share images",
-        "NSLocationWhenInUseUsageDescription": "ChatzOne uses location to find nearby matches"
-      }
+      "buildNumber": "1.0.0"
     },
     "android": {
       "adaptiveIcon": {
@@ -31,60 +25,21 @@
         "backgroundColor": "#6C5CE7"
       },
       "package": "com.chatzone.app",
-      "versionCode": 1,
-      "permissions": [
-        "CAMERA",
-        "RECORD_AUDIO",
-        "READ_EXTERNAL_STORAGE",
-        "WRITE_EXTERNAL_STORAGE",
-        "ACCESS_FINE_LOCATION",
-        "ACCESS_COARSE_LOCATION",
-        "INTERNET",
-        "VIBRATE"
-      ]
+      "versionCode": 1
     },
     "web": {
       "favicon": "./assets/favicon.png",
       "bundler": "metro"
     },
     "plugins": [
-      [
-        "expo-camera",
-        {
-          "cameraPermission": "Allow ChatzOne to access your camera for profile pictures and video calls."
-        }
-      ],
-      [
-        "expo-media-library",
-        {
-          "photosPermission": "Allow ChatzOne to access your photos to share images.",
-          "savePhotosPermission": "Allow ChatzOne to save photos to your library.",
-          "isAccessMediaLocationEnabled": true
-        }
-      ],
-      [
-        "expo-location",
-        {
-          "locationAlwaysAndWhenInUsePermission": "Allow ChatzOne to use your location to find nearby matches."
-        }
-      ],
-      [
-        "expo-notifications",
-        {
-          "icon": "./assets/notification-icon.png",
-          "color": "#6C5CE7",
-          "sounds": [
-            "./assets/sounds/message.wav",
-            "./assets/sounds/call.wav"
-          ]
-        }
-      ]
+      "expo-camera",
+      "expo-location",
+      "expo-notifications"
     ],
     "extra": {
       "eas": {
         "projectId": "your-eas-project-id"
       }
-    },
-    "owner": "chatzone-team"
+    }
   }
 }
